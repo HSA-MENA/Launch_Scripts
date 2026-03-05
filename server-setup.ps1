@@ -66,5 +66,8 @@ Write-Log "Extracting server.zip"
 Expand-Archive -Path $ZipPath -DestinationPath $TmpDir -Force
 Write-Log "server.zip extracted"
 
+# Allow local scripts to be run
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
+
 # Run the orchestrator
 & "$ScriptsDir\main.ps1"
