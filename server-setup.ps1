@@ -47,20 +47,17 @@ catch {
 
 Write-Log "Install links received"
 
-# Download server zip
-$ZipPath = Join-Path $TmpDir "server.zip"
-Write-Log "Downloading server.zip"
-Invoke-RestMethod -Uri $response.zipLink -OutFile $ZipPath
+# Download all files, preserving original filenames from the URL
+$links = @($response.zipLink, $response.certLink, $response.keyLink)
 
-# Download mTLS cert
-$CertPath = Join-Path $TmpDir "mtls.cert.pem"
-Write-Log "Downloading mTLS certificate"
-Invoke-RestMethod -Uri $response.certLink -OutFile $CertPath
+foreach ($link in $links) {
+    $fileName = [System.Uri]::new($link).Segments[-1]
+    $destPath = Join-Path $TmpDir $fileName
+    Write-Log "Downloading $fileName"
+    Invoke-RestMethod -Uri $link -OutFile $destPath
+}
 
-# Download mTLS key
-$KeyPath = Join-Path $TmpDir "mtls.key.pem"
-Write-Log "Downloading mTLS key"
-Invoke-RestMethod -Uri $response.keyLink -OutFile $KeyPath
+$ZipPath = Join-Path $TmpDir ([System.Uri]::new($response.zipLink).Segments[-1])
 
 Write-Log "All files downloaded"
 
