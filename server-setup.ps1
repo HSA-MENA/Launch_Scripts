@@ -67,4 +67,4 @@ Expand-Archive -Path $ZipPath -DestinationPath $TmpDir -Force
 Write-Log "server.zip extracted"
 
 # Run the orchestrator
-& "$TmpDir\main.ps1"
+& "$TmpDir\$ScriptsDir\main.ps1"
