@@ -1,6 +1,6 @@
 $EzPOSDir = Get-Location
 $LogFile = Join-Path $EzPOSDir "AutoUpdateReleaseLog.txt"
-$TmpDir = Join-Path $EzPOSDir "tmp"
+$TmpDir = Join-Path $EzPOSDir (Get-Date -Format "yyyy-MM-dd")
 $ScriptsDir = Join-Path $TmpDir "scripts"
 
 function Write-Log {
@@ -17,7 +17,7 @@ Write-Log "Script started"
 if (Test-Path $TmpDir) {
     Remove-Item -Path $TmpDir -Recurse -Force
 }
-New-Item -ItemType Directory -Path $ScriptsDir -Force | Out-Null
+New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
 
 # Prompt user for credentials
 $Pfid = Read-Host "Enter PFID"
