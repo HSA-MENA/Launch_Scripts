@@ -47,12 +47,18 @@ catch {
 
 Write-Log "Install links received"
 
-# Download all files, preserving original filenames from the URL
-$links = @($response.zipLink, $response.certLink, $response.keyLink)
+# Download zip to tmp dir
+$zipFileName = [System.Uri]::new($response.zipLink).Segments[-1]
+Write-Log "Downloading $zipFileName"
+Invoke-RestMethod -Uri $response.zipLink -OutFile (Join-Path $TmpDir $zipFileName)
 
-foreach ($link in $links) {
+# Download certificate and key to Certificate folder
+$CertDir = Join-Path $TmpDir "Certificate"
+New-Item -ItemType Directory -Path $CertDir -Force | Out-Null
+
+foreach ($link in @($response.certLink, $response.keyLink)) {
     $fileName = [System.Uri]::new($link).Segments[-1]
-    $destPath = Join-Path $TmpDir $fileName
+    $destPath = Join-Path $CertDir $fileName
     Write-Log "Downloading $fileName"
     Invoke-RestMethod -Uri $link -OutFile $destPath
 }
