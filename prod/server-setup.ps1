@@ -76,4 +76,4 @@ Write-Log "server.zip extracted"
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
 
 # Run the orchestrator
-& "$ScriptsDir\main.ps1"
+& "$ScriptsDir\main-prod.ps1"
