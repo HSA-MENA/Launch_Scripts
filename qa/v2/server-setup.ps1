@@ -11,7 +11,7 @@ $ApiBase = "https://avvxnj2l4urhi5a4aqgbilxkde.apigateway.me-abudhabi-1.oci.cust
 $Skeleton = @("apps", "bak", "certs", "resources", "scripts", "scripts/common")
 
 $EzPOSDir = Get-Location
-$LogFile = Join-Path $EzPOSDir "AutoUpdateReleaseLog.txt"
+$LogFile = Join-Path $EzPOSDir "releaseLog.txt"
 
 function Write-Log {
     param([string]$Message)
