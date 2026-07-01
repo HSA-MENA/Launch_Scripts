@@ -58,7 +58,7 @@ $Token = Read-Host "Enter Token"
 Write-Log "Fetching manifest for pfid=$Pfid"
 
 try {
-    $response = Invoke-RestMethod -Uri "$ApiBase/api/installs/v2?pfid=$Pfid&token=$Token" -Method Get
+    $response = Invoke-RestMethod -Uri "$ApiBase/installs/v2?pfid=$Pfid&token=$Token" -Method Get
 }
 catch {
     $statusCode = $_.Exception.Response.StatusCode.value__
