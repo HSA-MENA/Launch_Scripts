@@ -88,15 +88,19 @@ catch {
     return
 }
 
-if (Test-Path $WorkDir) {
-    Remove-Item -Path $WorkDir -Recurse -Force
-}
+# Ensure the workDir + skeleton exist, but DON'T wipe it: keeping already-
+# downloaded files lets a rerun after a partial failure skip work that already
+# finished. To force a clean reinstall, delete the workDir before running.
 New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
+
+# Completion markers for extracted archives live here (out of the content dirs).
+$StateDir = Join-Path $WorkDir ".state"
+New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
 
 foreach ($dir in $Skeleton) {
     New-Item -ItemType Directory -Path (Join-Path $WorkDir $dir) -Force | Out-Null
 }
-Write-Log "Created workDir and folder skeleton"
+Write-Log "Ensured workDir and folder skeleton"
 
 # --- Download (and extract) every file ----------------------------------------
 # Everything must succeed before we run the entrypoint; abort on any failure.
@@ -106,6 +110,14 @@ foreach ($file in $response.files) {
         New-Item -ItemType Directory -Path $destDir -Force | Out-Null
 
         if ($file.extract) {
+            # A marker is written only after a successful expand, so a completed
+            # extraction is skipped on rerun while a failed/partial one (no
+            # marker) is retried.
+            $marker = Join-Path $StateDir "$($file.id).extracted"
+            if (Test-Path $marker) {
+                Write-Log "Skipping $($file.id) -> $($file.dest) (already extracted)"
+                continue
+            }
             # Stage the archive inside its destination, expand it, then discard it.
             $archiveName = [System.Uri]::UnescapeDataString([System.Uri]::new($file.url).Segments[-1])
             $archivePath = Join-Path $destDir $archiveName
@@ -113,6 +125,7 @@ foreach ($file in $response.files) {
             Invoke-WebRequest -Uri $file.url -OutFile $archivePath -UseBasicParsing
             Expand-Archive -Path $archivePath -DestinationPath $destDir -Force
             Remove-Item -Path $archivePath -Force
+            New-Item -ItemType File -Path $marker -Force | Out-Null
         }
         else {
             $fileName = if ($file.PSObject.Properties['filename'] -and $file.filename) {
@@ -122,8 +135,16 @@ foreach ($file in $response.files) {
                 [System.Uri]::UnescapeDataString([System.Uri]::new($file.url).Segments[-1])
             }
             $destPath = Join-Path $destDir $fileName
+            if (Test-Path $destPath) {
+                Write-Log "Skipping $($file.id) -> $($file.dest)\$fileName (already present)"
+                continue
+            }
+            # Download to a temp file and rename on success, so an interrupted
+            # download never leaves a truncated file that a rerun would skip.
+            $tempPath = "$destPath.partial"
             Write-Log "Downloading $($file.id) -> $($file.dest)\$fileName"
-            Invoke-WebRequest -Uri $file.url -OutFile $destPath -UseBasicParsing
+            Invoke-WebRequest -Uri $file.url -OutFile $tempPath -UseBasicParsing
+            Move-Item -Path $tempPath -Destination $destPath -Force
         }
     }
     catch {
