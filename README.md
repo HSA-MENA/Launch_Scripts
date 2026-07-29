@@ -89,5 +89,4 @@ directory and both timestamped.
 ## Testing
 
 No automated tests. Verify against QA with a freshly-issued token; tokens are single-use and
-short-lived, so each run needs a new one. Install evidence is captured in
-[`Testing/autoUpdateInstall`](../../Testing/autoUpdateInstall).
+short-lived, so each run needs a new one.
