@@ -299,13 +299,32 @@ if (-not (Test-Path $EntrypointPath)) {
     return
 }
 
-$EntrypointArgs = @()
+# The manifest sends args as a flat list: "-Name", "value", "-Switch", ... Splatting that ARRAY
+# binds every element positionally -- "-Pfid" is just a string there, not a parameter name, so
+# the pfid landed in -Environment. A HASHTABLE splat binds by name, so fold the list into one.
+$EntrypointNamed = @{}
+$EntrypointPositional = @()
 if ($response.entrypoint.args) {
-    $EntrypointArgs = $response.entrypoint.args
+    $rawArgs = @($response.entrypoint.args)
+    for ($i = 0; $i -lt $rawArgs.Count; $i++) {
+        $a = [string]$rawArgs[$i]
+        if ($a -match '^-([A-Za-z]\w*)$') {
+            $name = $Matches[1]
+            $next = if ($i + 1 -lt $rawArgs.Count) { [string]$rawArgs[$i + 1] } else { $null }
+            if ($null -ne $next -and $next -notmatch '^-[A-Za-z]\w*$') {
+                $EntrypointNamed[$name] = $next
+                $i++
+            } else {
+                $EntrypointNamed[$name] = $true   # a bare switch
+            }
+        } else {
+            $EntrypointPositional += $a
+        }
+    }
 }
 
 # Allow local (downloaded) scripts to run for this process only.
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
 
 Write-Log "Running entrypoint $($response.entrypoint.path)"
-& $EntrypointPath @EntrypointArgs
+& $EntrypointPath @EntrypointNamed @EntrypointPositional
