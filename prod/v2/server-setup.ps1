@@ -1,4 +1,14 @@
 # Generic manifest-driven launcher (v2).
+#
+# Parameters (all optional; anything missing is prompted for, so a person at the console runs it
+# with none). Through Omni's script feature nothing can be typed, so a wrapper passes them:
+#   -Pfid, -Token   what staff would otherwise type.
+#   -InstallRoot    where the pharmacy's applications live (e.g. E:\Sapos-Application). Only a
+#                   manifest whose entrypoint args contain {installRoot} uses it, and such a
+#                   manifest refuses to run without it -- it is never guessed.
+# Exits 0 on success (or the entrypoint's own exit code), 1 on any failure here, so a caller
+# that only sees the process -- Omni's job status -- can tell.
+#
 # Prompts for PFID + token, asks the install API for a manifest describing every
 # file to download, where it goes, and what to run next, then executes it. The
 # script itself is use-case agnostic - all layout knowledge comes from the API.
@@ -8,6 +18,12 @@
 # which the API Gateway refuses, so the very first request fails with a connection
 # error that reads like the box has no internet. Pinned rather than added to,
 # because nothing this script talks to accepts anything older.
+param(
+    [string]$Pfid,
+    [string]$Token,
+    [string]$InstallRoot
+)
+
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $SupportedManifestVersion = 1
@@ -130,9 +146,10 @@ function Get-PrimaryMacAddress {
 
 Write-Log "Script started"
 
-# --- Prompt for credentials ---------------------------------------------------
-$Pfid = Read-Host "Enter PFID"
-$Token = Read-Host "Enter Token"
+# --- Credentials: parameters first, prompts only for what is missing ----------
+if (-not $Pfid)  { $Pfid  = Read-Host "Enter PFID" }
+if (-not $Token) { $Token = Read-Host "Enter Token" }
+if (-not $Pfid -or -not $Token) { Write-Log "ERROR: a PFID and a token are both required"; exit 1 }
 
 # --- Fetch the manifest -------------------------------------------------------
 Write-Log "Fetching manifest for pfid=$Pfid"
@@ -148,13 +165,13 @@ catch {
         422 { Write-Log "ERROR: No install manifest is configured for this token's use case (422)" }
         default { Write-Log "ERROR: API request failed - $($_.Exception.Message)" }
     }
-    return
+    exit 1
 }
 
 # --- Validate the manifest ----------------------------------------------------
 if ($response.manifestVersion -ne $SupportedManifestVersion) {
     Write-Log "ERROR: Unsupported manifestVersion $($response.manifestVersion) (this launcher supports $SupportedManifestVersion). Please update the launcher."
-    return
+    exit 1
 }
 
 Write-Log "Manifest received: type=$($response.type), workDir=$($response.workDir)"
@@ -165,7 +182,7 @@ try {
 }
 catch {
     Write-Log "ERROR: $($_.Exception.Message)"
-    return
+    exit 1
 }
 
 # Ensure the workDir + skeleton exist, but DON'T wipe it: keeping already-
@@ -209,7 +226,7 @@ foreach ($file in $response.files) {
             if ($file.PSObject.Properties['sha256'] -and $file.sha256) {
                 if (-not (Test-FileChecksum -Path $archivePath -Expected $file.sha256 -Id $file.id)) {
                     Write-Log "Aborting before entrypoint."
-                    return
+                    exit 1
                 }
             }
 
@@ -240,7 +257,7 @@ foreach ($file in $response.files) {
             if ($file.PSObject.Properties['sha256'] -and $file.sha256) {
                 if (-not (Test-FileChecksum -Path $tempPath -Expected $file.sha256 -Id $file.id)) {
                     Write-Log "Aborting before entrypoint."
-                    return
+                    exit 1
                 }
             }
 
@@ -249,7 +266,7 @@ foreach ($file in $response.files) {
     }
     catch {
         Write-Log "ERROR: Failed to download/extract '$($file.id)' - $($_.Exception.Message). Aborting before entrypoint."
-        return
+        exit 1
     }
 }
 
@@ -282,7 +299,7 @@ catch {
 # and stop cleanly.
 if (-not ($response.entrypoint -and $response.entrypoint.path)) {
     Write-Log "No entrypoint in manifest - files staged under $($response.workDir). Manual steps required; run the appropriate script yourself when ready."
-    return
+    exit 0
 }
 
 # --- Run the entrypoint -------------------------------------------------------
@@ -291,12 +308,12 @@ try {
 }
 catch {
     Write-Log "ERROR: $($_.Exception.Message)"
-    return
+    exit 1
 }
 
 if (-not (Test-Path $EntrypointPath)) {
     Write-Log "ERROR: Entrypoint not found at $($response.entrypoint.path)"
-    return
+    exit 1
 }
 
 # The manifest sends args as a flat list: "-Name", "value", "-Switch", ... Splatting that ARRAY
@@ -308,9 +325,19 @@ if ($response.entrypoint.args) {
     $rawArgs = @($response.entrypoint.args)
     for ($i = 0; $i -lt $rawArgs.Count; $i++) {
         $a = [string]$rawArgs[$i]
+        # {installRoot} is the one placeholder resolved on the box rather than by the API: only the
+        # person running this knows where the applications live.
+        if ($a -like '*{installRoot}*') {
+            if (-not $InstallRoot) { Write-Log "ERROR: this use case needs -InstallRoot (where the pharmacy's applications live); pass it and rerun"; exit 1 }
+            $a = $a.Replace('{installRoot}', $InstallRoot)
+        }
         if ($a -match '^-([A-Za-z]\w*)$') {
             $name = $Matches[1]
             $next = if ($i + 1 -lt $rawArgs.Count) { [string]$rawArgs[$i + 1] } else { $null }
+            if ($null -ne $next -and $next -like '*{installRoot}*') {
+                if (-not $InstallRoot) { Write-Log "ERROR: this use case needs -InstallRoot (where the pharmacy's applications live); pass it and rerun"; exit 1 }
+                $next = $next.Replace('{installRoot}', $InstallRoot)
+            }
             if ($null -ne $next -and $next -notmatch '^-[A-Za-z]\w*$') {
                 $EntrypointNamed[$name] = $next
                 $i++
@@ -327,4 +354,9 @@ if ($response.entrypoint.args) {
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
 
 Write-Log "Running entrypoint $($response.entrypoint.path)"
+$global:LASTEXITCODE = 0
 & $EntrypointPath @EntrypointNamed @EntrypointPositional
+$code = $LASTEXITCODE
+if (-not $?) { if (-not $code) { $code = 1 } }
+Write-Log "Entrypoint finished (exit $code)"
+exit $code

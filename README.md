@@ -3,7 +3,7 @@
 # Launch Scripts
 
 The bootstrap step of every customer install. A single PowerShell script that staff run on the
-target machine: it prompts for a PFID and token, asks the install API what to download, builds the
+target machine: it prompts for a PFID and token (or takes them as parameters), asks the install API what to download, builds the
 package folder structure, fetches the files, and hands off to the entrypoint script.
 
 Deliberately a **public repo with no sensitive details** — it is fetched onto customer machines, so
@@ -100,6 +100,31 @@ console, and a pharmacy install must never fail because a status update did not 
 > ```
 >
 > To start over from scratch, delete the `workDir` and issue a new token.
+
+### Parameters, and running it through Omni
+
+v2 takes three optional parameters. Without them it prompts as before.
+
+| Parameter | Use |
+|---|---|
+| `-Pfid`, `-Token` | what staff would otherwise type |
+| `-InstallRoot` | where the pharmacy's applications live, e.g. `E:\Sapos-Application`. Only a manifest whose entrypoint args contain `{installRoot}` uses it — the launcher fills that placeholder in on the box, since only the person running it knows the path — and such a manifest **refuses to run without it**. |
+
+It exits `1` on any failure of its own and otherwise with the entrypoint's exit code, so a caller
+that only sees the process can tell.
+
+Omni's script feature runs a `.ps1` already on the box, as LocalSystem, with no arguments and no
+console, so `Read-Host` cannot work there. Write a two-line wrapper beside the launcher with the
+console's file feature and run the wrapper:
+
+```powershell
+# C:\HSA-Install\launch\run.ps1
+Set-Location $PSScriptRoot
+& .\server-setup.ps1 -Pfid PF3173 -Token <token> -InstallRoot 'E:\Sapos-Application'
+exit $LASTEXITCODE
+```
+
+The package lands under that folder (the working directory), exactly as an interactive run would.
 
 ## Security note
 
