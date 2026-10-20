@@ -24,6 +24,22 @@ param(
     [string]$InstallRoot
 )
 
+# Omni's service is a 32-bit process, so the powershell.exe it starts is the 32-bit one -- and so is
+# every entrypoint this launcher runs in-process. 32-bit PowerShell cannot load IIS's management
+# classes (64-bit only: the eRx site looks absent) and reads the 32-bit registry view. Re-run in
+# 64-bit PowerShell, same folder, same parameters, and hand back its exit code.
+if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+    $forward = @()
+    foreach ($k in $PSBoundParameters.Keys) {
+        $v = [string]$PSBoundParameters[$k]
+        # PowerShell quotes a value with a space; a trailing \ would then escape that quote.
+        if ($v -match '\s' -and $v.EndsWith('\')) { $v += '\' }
+        $forward += "-$k"; $forward += $v
+    }
+    & "$env:WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @forward
+    exit $LASTEXITCODE
+}
+
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $SupportedManifestVersion = 1

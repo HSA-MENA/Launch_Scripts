@@ -126,6 +126,11 @@ exit $LASTEXITCODE
 
 The package lands under that folder (the working directory), exactly as an interactive run would.
 
+Omni's service is a 32-bit process, so the PowerShell it starts is 32-bit. The launcher re-runs
+itself in 64-bit PowerShell (`Sysnative`) with the same parameters before doing anything, so every
+entrypoint runs 64-bit: IIS's management module (the eRx site) and the 64-bit registry are only
+visible there.
+
 ## Security note
 
 v2 validates every server-supplied path before using it (`Resolve-SafePath`): no rooted paths, no
