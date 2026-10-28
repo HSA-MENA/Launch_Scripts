@@ -7,7 +7,9 @@
 #                   manifest whose entrypoint args contain {installRoot} uses it, and such a
 #                   manifest refuses to run without it -- it is never guessed.
 # Exits 0 on success (or the entrypoint's own exit code), 1 on any failure here, so a caller
-# that only sees the process -- Omni's job status -- can tell.
+# that only sees the process -- Omni's job status -- can tell. Run as `irm ... | iex` there is no
+# process of its own to exit: `exit` would close the person's console and the output with it, so
+# it sets $LASTEXITCODE and returns instead.
 #
 # Prompts for PFID + token, asks the install API for a manifest describing every
 # file to download, where it goes, and what to run next, then executes it. The
@@ -160,219 +162,227 @@ function Get-PrimaryMacAddress {
     return ""
 }
 
-Write-Log "Script started"
+$ExitCode = 0
+:run do {
+    Write-Log "Script started"
 
-# --- Credentials: parameters first, prompts only for what is missing ----------
-if (-not $Pfid)  { $Pfid  = Read-Host "Enter PFID" }
-if (-not $Token) { $Token = Read-Host "Enter Token" }
-if (-not $Pfid -or -not $Token) { Write-Log "ERROR: a PFID and a token are both required"; exit 1 }
+    # --- Credentials: parameters first, prompts only for what is missing ----------
+    if (-not $Pfid)  { $Pfid  = Read-Host "Enter PFID" }
+    if (-not $Token) { $Token = Read-Host "Enter Token" }
+    if (-not $Pfid -or -not $Token) { Write-Log "ERROR: a PFID and a token are both required"; $ExitCode = 1; break run }
 
-# --- Fetch the manifest -------------------------------------------------------
-Write-Log "Fetching manifest for pfid=$Pfid"
+    # --- Fetch the manifest -------------------------------------------------------
+    Write-Log "Fetching manifest for pfid=$Pfid"
 
-try {
-    $response = Invoke-RestMethod -Uri "$ApiBase/installs/v2?pfid=$Pfid&token=$Token" -Method Get
-}
-catch {
-    $statusCode = $_.Exception.Response.StatusCode.value__
-    switch ($statusCode) {
-        400 { Write-Log "ERROR: Token has expired (400)" }
-        404 { Write-Log "ERROR: pfid/token combination not found (404)" }
-        422 { Write-Log "ERROR: No install manifest is configured for this token's use case (422)" }
-        default { Write-Log "ERROR: API request failed - $($_.Exception.Message)" }
-    }
-    exit 1
-}
-
-# --- Validate the manifest ----------------------------------------------------
-if ($response.manifestVersion -ne $SupportedManifestVersion) {
-    Write-Log "ERROR: Unsupported manifestVersion $($response.manifestVersion) (this launcher supports $SupportedManifestVersion). Please update the launcher."
-    exit 1
-}
-
-Write-Log "Manifest received: type=$($response.type), workDir=$($response.workDir)"
-
-# --- Create the workDir + full skeleton ---------------------------------------
-try {
-    $WorkDir = Resolve-SafePath -Root $EzPOSDir -Relative $response.workDir
-}
-catch {
-    Write-Log "ERROR: $($_.Exception.Message)"
-    exit 1
-}
-
-# Ensure the workDir + skeleton exist, but DON'T wipe it: keeping already-
-# downloaded files lets a rerun after a partial failure skip work that already
-# finished. To force a clean reinstall, delete the workDir before running.
-New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
-
-# Completion markers for extracted archives live here (out of the content dirs).
-$StateDir = Join-Path $WorkDir ".state"
-New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
-
-foreach ($dir in $Skeleton) {
-    New-Item -ItemType Directory -Path (Join-Path $WorkDir $dir) -Force | Out-Null
-}
-Write-Log "Ensured workDir and folder skeleton"
-
-# --- Download (and extract) every file ----------------------------------------
-# Everything must succeed before we run the entrypoint; abort on any failure.
-foreach ($file in $response.files) {
     try {
-        $destDir = Resolve-SafePath -Root $WorkDir -Relative $file.dest
-        New-Item -ItemType Directory -Path $destDir -Force | Out-Null
-
-        if ($file.extract) {
-            # A marker is written only after a successful expand, so a completed
-            # extraction is skipped on rerun while a failed/partial one (no
-            # marker) is retried.
-            $marker = Join-Path $StateDir "$($file.id).extracted"
-            if (Test-Path $marker) {
-                Write-Log "Skipping $($file.id) -> $($file.dest) (already extracted)"
-                continue
-            }
-            # Stage the archive inside its destination, expand it, then discard it.
-            $archiveName = [System.Uri]::UnescapeDataString([System.Uri]::new($file.url).Segments[-1])
-            $archivePath = Join-Path $destDir $archiveName
-            Write-Log "Downloading $($file.id) -> $($file.dest) (extract)"
-            Invoke-WebRequest -Uri $file.url -OutFile $archivePath -UseBasicParsing
-
-            # Checked BEFORE expanding: an archive that does not match is never unpacked, so a
-            # corrupted or substituted download cannot put a single file on the box.
-            if ($file.PSObject.Properties['sha256'] -and $file.sha256) {
-                if (-not (Test-FileChecksum -Path $archivePath -Expected $file.sha256 -Id $file.id)) {
-                    Write-Log "Aborting before entrypoint."
-                    exit 1
-                }
-            }
-
-            Expand-Archive -Path $archivePath -DestinationPath $destDir -Force
-            Remove-Item -Path $archivePath -Force
-            New-Item -ItemType File -Path $marker -Force | Out-Null
-        }
-        else {
-            $fileName = if ($file.PSObject.Properties['filename'] -and $file.filename) {
-                $file.filename
-            }
-            else {
-                [System.Uri]::UnescapeDataString([System.Uri]::new($file.url).Segments[-1])
-            }
-            $destPath = Join-Path $destDir $fileName
-            if (Test-Path $destPath) {
-                Write-Log "Skipping $($file.id) -> $($file.dest)\$fileName (already present)"
-                continue
-            }
-            # Download to a temp file and rename on success, so an interrupted
-            # download never leaves a truncated file that a rerun would skip.
-            $tempPath = "$destPath.partial"
-            Write-Log "Downloading $($file.id) -> $($file.dest)\$fileName"
-            Invoke-WebRequest -Uri $file.url -OutFile $tempPath -UseBasicParsing
-
-            # Checked while it is still .partial, so a file that fails never reaches the name a
-            # rerun would treat as already present.
-            if ($file.PSObject.Properties['sha256'] -and $file.sha256) {
-                if (-not (Test-FileChecksum -Path $tempPath -Expected $file.sha256 -Id $file.id)) {
-                    Write-Log "Aborting before entrypoint."
-                    exit 1
-                }
-            }
-
-            Move-Item -Path $tempPath -Destination $destPath -Force
-        }
+        $response = Invoke-RestMethod -Uri "$ApiBase/installs/v2?pfid=$Pfid&token=$Token" -Method Get
     }
     catch {
-        Write-Log "ERROR: Failed to download/extract '$($file.id)' - $($_.Exception.Message). Aborting before entrypoint."
-        exit 1
-    }
-}
-
-Write-Log "All files downloaded and placed"
-
-# --- Consume the token --------------------------------------------------------
-# Here, and not later: the token's job is to authorise these downloads, and they are done. A
-# failed entrypoint is recovered by re-running scripts\main.ps1 out of the staging folder, not by
-# downloading everything again -- so holding the token open for that would protect nothing.
-#
-# **After this point the token no longer resolves.** A rerun of THIS script gets a 404. Re-run
-# the entrypoint directly instead; see the README.
-#
-# A failure here is a warning, never fatal. This is bookkeeping for the console, and a pharmacy
-# install must not fail because a status update did not land.
-try {
-    $mac = Get-PrimaryMacAddress
-    $body = @{ MAC = $mac } | ConvertTo-Json -Compress
-    Invoke-RestMethod -Method Put -Uri "$ApiBase/installs/$Pfid/$Token" `
-        -ContentType "application/json" -Body $body | Out-Null
-    Write-Log "token marked used (MAC $mac)"
-}
-catch {
-    Write-Log "WARNING: could not mark the token used - $($_.Exception.Message). The install continues; mark it in the Admin Console by hand."
-}
-
-# --- Run the entrypoint (if the manifest provides one) ------------------------
-# A manifest may omit the entrypoint for use cases where staff perform manual
-# steps and launch the next script themselves. In that case we stage the files
-# and stop cleanly.
-if (-not ($response.entrypoint -and $response.entrypoint.path)) {
-    Write-Log "No entrypoint in manifest - files staged under $($response.workDir). Manual steps required; run the appropriate script yourself when ready."
-    exit 0
-}
-
-# --- Run the entrypoint -------------------------------------------------------
-try {
-    $EntrypointPath = Resolve-SafePath -Root $WorkDir -Relative $response.entrypoint.path
-}
-catch {
-    Write-Log "ERROR: $($_.Exception.Message)"
-    exit 1
-}
-
-if (-not (Test-Path $EntrypointPath)) {
-    Write-Log "ERROR: Entrypoint not found at $($response.entrypoint.path)"
-    exit 1
-}
-
-# The manifest sends args as a flat list: "-Name", "value", "-Switch", ... Splatting that ARRAY
-# binds every element positionally -- "-Pfid" is just a string there, not a parameter name, so
-# the pfid landed in -Environment. A HASHTABLE splat binds by name, so fold the list into one.
-$EntrypointNamed = @{}
-$EntrypointPositional = @()
-if ($response.entrypoint.args) {
-    $rawArgs = @($response.entrypoint.args)
-    for ($i = 0; $i -lt $rawArgs.Count; $i++) {
-        $a = [string]$rawArgs[$i]
-        # {installRoot} is the one placeholder resolved on the box rather than by the API: only the
-        # person running this knows where the applications live.
-        if ($a -like '*{installRoot}*') {
-            if (-not $InstallRoot) { Write-Log "ERROR: this use case needs -InstallRoot (where the pharmacy's applications live); pass it and rerun"; exit 1 }
-            $a = $a.Replace('{installRoot}', $InstallRoot)
+        $statusCode = $_.Exception.Response.StatusCode.value__
+        switch ($statusCode) {
+            400 { Write-Log "ERROR: Token has expired (400)" }
+            404 { Write-Log "ERROR: pfid/token combination not found (404)" }
+            422 { Write-Log "ERROR: No install manifest is configured for this token's use case (422)" }
+            default { Write-Log "ERROR: API request failed - $($_.Exception.Message)" }
         }
-        if ($a -match '^-([A-Za-z]\w*)$') {
-            $name = $Matches[1]
-            $next = if ($i + 1 -lt $rawArgs.Count) { [string]$rawArgs[$i + 1] } else { $null }
-            if ($null -ne $next -and $next -like '*{installRoot}*') {
-                if (-not $InstallRoot) { Write-Log "ERROR: this use case needs -InstallRoot (where the pharmacy's applications live); pass it and rerun"; exit 1 }
-                $next = $next.Replace('{installRoot}', $InstallRoot)
+        $ExitCode = 1; break run
+    }
+
+    # --- Validate the manifest ----------------------------------------------------
+    if ($response.manifestVersion -ne $SupportedManifestVersion) {
+        Write-Log "ERROR: Unsupported manifestVersion $($response.manifestVersion) (this launcher supports $SupportedManifestVersion). Please update the launcher."
+        $ExitCode = 1; break run
+    }
+
+    Write-Log "Manifest received: type=$($response.type), workDir=$($response.workDir)"
+
+    # --- Create the workDir + full skeleton ---------------------------------------
+    try {
+        $WorkDir = Resolve-SafePath -Root $EzPOSDir -Relative $response.workDir
+    }
+    catch {
+        Write-Log "ERROR: $($_.Exception.Message)"
+        $ExitCode = 1; break run
+    }
+
+    # Ensure the workDir + skeleton exist, but DON'T wipe it: keeping already-
+    # downloaded files lets a rerun after a partial failure skip work that already
+    # finished. To force a clean reinstall, delete the workDir before running.
+    New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
+
+    # Completion markers for extracted archives live here (out of the content dirs).
+    $StateDir = Join-Path $WorkDir ".state"
+    New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
+
+    foreach ($dir in $Skeleton) {
+        New-Item -ItemType Directory -Path (Join-Path $WorkDir $dir) -Force | Out-Null
+    }
+    Write-Log "Ensured workDir and folder skeleton"
+
+    # --- Download (and extract) every file ----------------------------------------
+    # Everything must succeed before we run the entrypoint; abort on any failure.
+    foreach ($file in $response.files) {
+        try {
+            $destDir = Resolve-SafePath -Root $WorkDir -Relative $file.dest
+            New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+
+            if ($file.extract) {
+                # A marker is written only after a successful expand, so a completed
+                # extraction is skipped on rerun while a failed/partial one (no
+                # marker) is retried.
+                $marker = Join-Path $StateDir "$($file.id).extracted"
+                if (Test-Path $marker) {
+                    Write-Log "Skipping $($file.id) -> $($file.dest) (already extracted)"
+                    continue
+                }
+                # Stage the archive inside its destination, expand it, then discard it.
+                $archiveName = [System.Uri]::UnescapeDataString([System.Uri]::new($file.url).Segments[-1])
+                $archivePath = Join-Path $destDir $archiveName
+                Write-Log "Downloading $($file.id) -> $($file.dest) (extract)"
+                Invoke-WebRequest -Uri $file.url -OutFile $archivePath -UseBasicParsing
+
+                # Checked BEFORE expanding: an archive that does not match is never unpacked, so a
+                # corrupted or substituted download cannot put a single file on the box.
+                if ($file.PSObject.Properties['sha256'] -and $file.sha256) {
+                    if (-not (Test-FileChecksum -Path $archivePath -Expected $file.sha256 -Id $file.id)) {
+                        Write-Log "Aborting before entrypoint."
+                        $ExitCode = 1; break run
+                    }
+                }
+
+                Expand-Archive -Path $archivePath -DestinationPath $destDir -Force
+                Remove-Item -Path $archivePath -Force
+                New-Item -ItemType File -Path $marker -Force | Out-Null
             }
-            if ($null -ne $next -and $next -notmatch '^-[A-Za-z]\w*$') {
-                $EntrypointNamed[$name] = $next
-                $i++
+            else {
+                $fileName = if ($file.PSObject.Properties['filename'] -and $file.filename) {
+                    $file.filename
+                }
+                else {
+                    [System.Uri]::UnescapeDataString([System.Uri]::new($file.url).Segments[-1])
+                }
+                $destPath = Join-Path $destDir $fileName
+                if (Test-Path $destPath) {
+                    Write-Log "Skipping $($file.id) -> $($file.dest)\$fileName (already present)"
+                    continue
+                }
+                # Download to a temp file and rename on success, so an interrupted
+                # download never leaves a truncated file that a rerun would skip.
+                $tempPath = "$destPath.partial"
+                Write-Log "Downloading $($file.id) -> $($file.dest)\$fileName"
+                Invoke-WebRequest -Uri $file.url -OutFile $tempPath -UseBasicParsing
+
+                # Checked while it is still .partial, so a file that fails never reaches the name a
+                # rerun would treat as already present.
+                if ($file.PSObject.Properties['sha256'] -and $file.sha256) {
+                    if (-not (Test-FileChecksum -Path $tempPath -Expected $file.sha256 -Id $file.id)) {
+                        Write-Log "Aborting before entrypoint."
+                        $ExitCode = 1; break run
+                    }
+                }
+
+                Move-Item -Path $tempPath -Destination $destPath -Force
+            }
+        }
+        catch {
+            Write-Log "ERROR: Failed to download/extract '$($file.id)' - $($_.Exception.Message). Aborting before entrypoint."
+            $ExitCode = 1; break run
+        }
+    }
+
+    Write-Log "All files downloaded and placed"
+
+    # --- Consume the token --------------------------------------------------------
+    # Here, and not later: the token's job is to authorise these downloads, and they are done. A
+    # failed entrypoint is recovered by re-running scripts\main.ps1 out of the staging folder, not by
+    # downloading everything again -- so holding the token open for that would protect nothing.
+    #
+    # **After this point the token no longer resolves.** A rerun of THIS script gets a 404. Re-run
+    # the entrypoint directly instead; see the README.
+    #
+    # A failure here is a warning, never fatal. This is bookkeeping for the console, and a pharmacy
+    # install must not fail because a status update did not land.
+    try {
+        $mac = Get-PrimaryMacAddress
+        $body = @{ MAC = $mac } | ConvertTo-Json -Compress
+        Invoke-RestMethod -Method Put -Uri "$ApiBase/installs/$Pfid/$Token" `
+            -ContentType "application/json" -Body $body | Out-Null
+        Write-Log "token marked used (MAC $mac)"
+    }
+    catch {
+        Write-Log "WARNING: could not mark the token used - $($_.Exception.Message). The install continues; mark it in the Admin Console by hand."
+    }
+
+    # --- Run the entrypoint (if the manifest provides one) ------------------------
+    # A manifest may omit the entrypoint for use cases where staff perform manual
+    # steps and launch the next script themselves. In that case we stage the files
+    # and stop cleanly.
+    if (-not ($response.entrypoint -and $response.entrypoint.path)) {
+        Write-Log "No entrypoint in manifest - files staged under $($response.workDir). Manual steps required; run the appropriate script yourself when ready."
+        $ExitCode = 0; break run
+    }
+
+    # --- Run the entrypoint -------------------------------------------------------
+    try {
+        $EntrypointPath = Resolve-SafePath -Root $WorkDir -Relative $response.entrypoint.path
+    }
+    catch {
+        Write-Log "ERROR: $($_.Exception.Message)"
+        $ExitCode = 1; break run
+    }
+
+    if (-not (Test-Path $EntrypointPath)) {
+        Write-Log "ERROR: Entrypoint not found at $($response.entrypoint.path)"
+        $ExitCode = 1; break run
+    }
+
+    # The manifest sends args as a flat list: "-Name", "value", "-Switch", ... Splatting that ARRAY
+    # binds every element positionally -- "-Pfid" is just a string there, not a parameter name, so
+    # the pfid landed in -Environment. A HASHTABLE splat binds by name, so fold the list into one.
+    $EntrypointNamed = @{}
+    $EntrypointPositional = @()
+    if ($response.entrypoint.args) {
+        $rawArgs = @($response.entrypoint.args)
+        for ($i = 0; $i -lt $rawArgs.Count; $i++) {
+            $a = [string]$rawArgs[$i]
+            # {installRoot} is the one placeholder resolved on the box rather than by the API: only the
+            # person running this knows where the applications live.
+            if ($a -like '*{installRoot}*') {
+                if (-not $InstallRoot) { Write-Log "ERROR: this use case needs -InstallRoot (where the pharmacy's applications live); pass it and rerun"; $ExitCode = 1; break run }
+                $a = $a.Replace('{installRoot}', $InstallRoot)
+            }
+            if ($a -match '^-([A-Za-z]\w*)$') {
+                $name = $Matches[1]
+                $next = if ($i + 1 -lt $rawArgs.Count) { [string]$rawArgs[$i + 1] } else { $null }
+                if ($null -ne $next -and $next -like '*{installRoot}*') {
+                    if (-not $InstallRoot) { Write-Log "ERROR: this use case needs -InstallRoot (where the pharmacy's applications live); pass it and rerun"; $ExitCode = 1; break run }
+                    $next = $next.Replace('{installRoot}', $InstallRoot)
+                }
+                if ($null -ne $next -and $next -notmatch '^-[A-Za-z]\w*$') {
+                    $EntrypointNamed[$name] = $next
+                    $i++
+                } else {
+                    $EntrypointNamed[$name] = $true   # a bare switch
+                }
             } else {
-                $EntrypointNamed[$name] = $true   # a bare switch
+                $EntrypointPositional += $a
             }
-        } else {
-            $EntrypointPositional += $a
         }
     }
-}
 
-# Allow local (downloaded) scripts to run for this process only.
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
+    # Allow local (downloaded) scripts to run for this process only.
+    Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process
 
-Write-Log "Running entrypoint $($response.entrypoint.path)"
-$global:LASTEXITCODE = 0
-& $EntrypointPath @EntrypointNamed @EntrypointPositional
-$code = $LASTEXITCODE
-if (-not $?) { if (-not $code) { $code = 1 } }
-Write-Log "Entrypoint finished (exit $code)"
-exit $code
+    Write-Log "Running entrypoint $($response.entrypoint.path)"
+    $global:LASTEXITCODE = 0
+    & $EntrypointPath @EntrypointNamed @EntrypointPositional
+    $code = $LASTEXITCODE
+    if (-not $?) { if (-not $code) { $code = 1 } }
+    Write-Log "Entrypoint finished (exit $code)"
+    $ExitCode = $code
+} while ($false)
+
+# Every stop above breaks out of this one-pass loop with $ExitCode set. Started with -File
+# (Omni, the 64-bit relaunch) there is a process to exit; under iex it is the person's console.
+if ($PSCommandPath) { exit $ExitCode }
+$global:LASTEXITCODE = $ExitCode
